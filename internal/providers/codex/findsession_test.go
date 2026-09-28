@@ -189,3 +189,40 @@ func TestFindSessionFileByMetaID_ThreadVsRoot(t *testing.T) {
 		t.Fatalf("resolve: got %q want %q", got, path)
 	}
 }
+
+func TestReadSessionMeta_ReadsEachRolloutOnce(t *testing.T) {
+	home := withTempCodexHome(t)
+	mtime := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	path := writeRolloutWithCwd(t, home, "019f656b-0657-78e2-b16f-9ed6b0872001", "2026/07/15", "/Users/senna/first", mtime, false)
+	if got := readSessionMetaCwd(path); got != "/Users/senna/first" {
+		t.Fatalf("got %q", got)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSessionMetaCwd(path); got != "/Users/senna/first" {
+		t.Fatalf("session_meta must be served from memory after the first read, got %q", got)
+	}
+}
+
+func TestReadSessionMeta_RetriesUnflushedRollout(t *testing.T) {
+	home := withTempCodexHome(t)
+	dayPath := filepath.Join(home, "sessions", "2026/07/15")
+	if err := os.MkdirAll(dayPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dayPath, "rollout-2026-07-15T12-00-00-019f656b-0657-78e2-b16f-9ed6b0872002.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSessionMetaCwd(path); got != "" {
+		t.Fatalf("empty rollout got %q", got)
+	}
+	meta := `{"type":"session_meta","payload":{"cwd":"/Users/senna/late"}}` + "\n"
+	if err := os.WriteFile(path, []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSessionMetaCwd(path); got != "/Users/senna/late" {
+		t.Fatalf("flushed rollout got %q", got)
+	}
+}

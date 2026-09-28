@@ -70,3 +70,45 @@ func TestSameProjectArchiveRename(t *testing.T) {
 		t.Fatal("false positive")
 	}
 }
+
+func TestMatcherAgreesWithEqualAndSameProject(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real-project")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link-project")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip("symlink not supported")
+	}
+	candidates := []string{
+		"", real, real + "/", link, "/var/folders/xy/tmp", "/private/var/folders/xy/tmp",
+		"/elsewhere/real-project", "/elsewhere/real-project-archived", "/elsewhere/other",
+	}
+	for _, target := range []string{"", real, link, "/var/folders/xy/tmp", "/elsewhere/real-project"} {
+		matcher := NewMatcher(target)
+		for _, candidate := range candidates {
+			// Ask twice so the memoized path is exercised too.
+			for range 2 {
+				if got, want := matcher.Equal(candidate), Equal(candidate, target); got != want {
+					t.Fatalf("Equal(%q, %q): matcher=%v want %v", candidate, target, got, want)
+				}
+				if got, want := matcher.SameProject(candidate), SameProject(candidate, target); got != want {
+					t.Fatalf("SameProject(%q, %q): matcher=%v want %v", candidate, target, got, want)
+				}
+			}
+		}
+	}
+}
+
+func TestMatcherResolvesEachPathOnce(t *testing.T) {
+	matcher := NewMatcher("/a/target")
+	for range 3 {
+		for _, candidate := range []string{"/a/one", "/a/two", "/a/one"} {
+			matcher.SameProject(candidate)
+		}
+	}
+	if got := len(matcher.normalized); got != 3 {
+		t.Fatalf("normalized %d distinct paths, want 3 (target + 2 candidates)", got)
+	}
+}
