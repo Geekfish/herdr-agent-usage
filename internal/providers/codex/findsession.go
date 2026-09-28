@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/senna-lang/herdr-agent-usage/internal/fsutil"
 	"github.com/senna-lang/herdr-agent-usage/internal/pathutil"
@@ -122,7 +123,24 @@ type sessionMeta struct {
 	id        string
 }
 
+// sessionMetaCache memoizes session_meta by rollout path for the process.
+// Codex writes session_meta once as the first line, and every per-pane lookup
+// otherwise reopens every rollout on disk. Empty results are not cached so a
+// rollout read before its first line is flushed is retried.
+var sessionMetaCache sync.Map
+
 func readSessionMeta(path string) sessionMeta {
+	if cached, ok := sessionMetaCache.Load(path); ok {
+		return cached.(sessionMeta)
+	}
+	meta := readSessionMetaUncached(path)
+	if meta != (sessionMeta{}) {
+		sessionMetaCache.Store(path, meta)
+	}
+	return meta
+}
+
+func readSessionMetaUncached(path string) sessionMeta {
 	first, err := fsutil.ReadFirstLine(path, 1024*1024)
 	if err != nil {
 		return sessionMeta{}
@@ -198,16 +216,17 @@ func FindLatestSessionFileForCwdIn(home, cwd string) string {
 	}
 	var exact []rolloutCandidate
 	var weak []rolloutCandidate
+	matcher := pathutil.NewMatcher(cwd)
 	for _, candidate := range listRolloutCandidatesIn(home) {
 		metaCwd := readSessionMetaCwd(candidate.path)
 		if metaCwd == "" {
 			continue
 		}
-		if pathutil.Equal(metaCwd, cwd) {
+		if matcher.Equal(metaCwd) {
 			exact = append(exact, candidate)
 			continue
 		}
-		if pathutil.SameProject(metaCwd, cwd) {
+		if matcher.SameProject(metaCwd) {
 			weak = append(weak, candidate)
 		}
 	}

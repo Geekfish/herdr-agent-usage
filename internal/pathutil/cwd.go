@@ -31,18 +31,56 @@ func Normalize(p string) string {
 
 // Equal reports whether a and b refer to the same directory for session matching.
 func Equal(a, b string) bool {
+	return equalWith(a, b, Normalize)
+}
+
+func equalWith(a, b string, normalize func(string) string) bool {
 	if a == b {
 		return true
 	}
 	if a == "" || b == "" {
 		return false
 	}
-	if Normalize(a) == Normalize(b) {
+	na, nb := normalize(a), normalize(b)
+	if na == nb {
 		return true
 	}
 	// macOS often records /var/... while tools see /private/var/...
-	na, nb := stripPrivatePrefix(Normalize(a)), stripPrivatePrefix(Normalize(b))
+	na, nb = stripPrivatePrefix(na), stripPrivatePrefix(nb)
 	return na == nb && na != ""
+}
+
+// Matcher compares many candidate paths against one target, resolving each
+// distinct path at most once. Session scans compare thousands of rollouts
+// that share a handful of cwds; Normalize walks symlinks with one lstat per
+// path component, so uncached comparisons dominate a scan.
+type Matcher struct {
+	target     string
+	normalized map[string]string
+}
+
+// NewMatcher returns a Matcher for target. It is not safe for concurrent use.
+func NewMatcher(target string) *Matcher {
+	return &Matcher{target: target, normalized: map[string]string{}}
+}
+
+func (m *Matcher) normalize(p string) string {
+	if n, ok := m.normalized[p]; ok {
+		return n
+	}
+	n := Normalize(p)
+	m.normalized[p] = n
+	return n
+}
+
+// Equal is Equal(p, target).
+func (m *Matcher) Equal(p string) bool {
+	return equalWith(p, m.target, m.normalize)
+}
+
+// SameProject is SameProject(p, target).
+func (m *Matcher) SameProject(p string) bool {
+	return m.Equal(p) || sameBaseName(p, m.target)
 }
 
 func stripPrivatePrefix(p string) string {
@@ -72,9 +110,10 @@ func BaseName(p string) string {
 // renames as the same project: `my-app` ↔ `my-app-archived` / `my-app_old`.
 // Callers must still rank by recency when multiple projects share a basename.
 func SameProject(a, b string) bool {
-	if Equal(a, b) {
-		return true
-	}
+	return Equal(a, b) || sameBaseName(a, b)
+}
+
+func sameBaseName(a, b string) bool {
 	ba, bb := BaseName(a), BaseName(b)
 	if ba == "" || bb == "" {
 		return false
