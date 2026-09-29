@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -157,9 +158,9 @@ func activeMessages(db *sql.DB, sessionID string) []message {
 			continue
 		}
 		if toolCalls != "" {
-			if json.Unmarshal([]byte(toolCalls), &m.ToolCalls) != nil {
-				m.ToolCalls = nil
-			}
+			// decodeJSON keeps numeric literals verbatim; a float such as 5.0
+			// re-encoded as 5 would break fingerprint equality with Hermes.
+			m.ToolCalls = decodeJSON(toolCalls)
 		}
 		out = append(out, m)
 	}
@@ -427,6 +428,11 @@ func backendIdentity(billingProvider, baseURL string) string {
 		return ""
 	}
 	host := strings.ToLower(u.Hostname())
+	// A literal address has no registrable domain to shorten; taking the
+	// penultimate dotted component of 127.0.0.1 would label the backend "0".
+	if net.ParseIP(host) != nil {
+		return host
+	}
 	host = strings.TrimPrefix(host, "api.")
 	parts := strings.Split(host, ".")
 	if len(parts) >= 2 {

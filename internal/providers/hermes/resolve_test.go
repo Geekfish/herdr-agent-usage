@@ -210,3 +210,42 @@ func TestCostAndBaseURLFallback(t *testing.T) {
 		t.Fatalf("fallback=%#v", got)
 	}
 }
+
+// A local OpenAI-compatible server has no registrable domain; its literal
+// address must stay intact rather than collapsing to a dotted fragment.
+func TestBackendIdentityKeepsLiteralAddresses(t *testing.T) {
+	for _, tc := range []struct{ baseURL, want string }{
+		{"http://127.0.0.1:8000/v1", "127.0.0.1"},
+		{"http://[::1]:8000/v1", "::1"},
+		{"https://api.deepseek.com/v1", "deepseek"},
+		{"http://localhost:1234/v1", "localhost"},
+	} {
+		if got := backendIdentity("", tc.baseURL); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.baseURL, got, tc.want)
+		}
+	}
+	if got := backendIdentity("llm-rosetta", "http://127.0.0.1:8000/v1"); got != "llm-rosetta" {
+		t.Errorf("recorded provider must win: %q", got)
+	}
+}
+
+// Hermes hashes the Python object, where a tool-call float 5.0 serializes
+// as 5.0; re-encoding it as 5 would reject an otherwise valid anchor.
+func TestToolCallFloatsPreserveAnchorValidity(t *testing.T) {
+	home := t.TempDir()
+	db := openFixture(t, home)
+	toolCalls := `[{"id":"c1","function":{"name":"f","arguments":"{}"},"index":5.0}]`
+	base := []message{{Role: "assistant", Content: "calling", ToolCalls: decodeJSON(toolCalls)}}
+	cfg := anchorConfig(t, base, 100, 5)
+	if _, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens) VALUES ('s','m',?,900,100)`, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (session_id,role,content,tool_calls,active) VALUES ('s','assistant','calling',?,1)`, toolCalls); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	got := ResolveUsageIn(home, "s")
+	if got == nil || got.ContextTokens != 105 {
+		t.Fatalf("float tool-call anchor rejected: %#v", got)
+	}
+}
