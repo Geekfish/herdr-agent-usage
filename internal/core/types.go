@@ -3,6 +3,32 @@
  */
 package core
 
+// BillingClass is how a session's spend is accounted for. Providers classify
+// their own vendor-specific billing routes into these shared values, so no
+// shared layer ever interprets a vendor billing string.
+type BillingClass int
+
+const (
+	// BillingClassUnknown means the provider has no evidence either way.
+	BillingClassUnknown BillingClass = iota
+	// BillingClassSubscription means the session's spend is covered by a
+	// plan, so quota windows (not a burn total) are the meaningful display.
+	BillingClassSubscription
+	// BillingClassPayAsYouGo means the session is billed per token, so its
+	// own token and cost totals are the meaningful display.
+	BillingClassPayAsYouGo
+)
+
+// SessionBilling is one session's own billing facts, reported by providers
+// whose harness records what it billed. Backend is a display label for the
+// billed endpoint; Tokens and CostUSD are session-cumulative.
+type SessionBilling struct {
+	Class   BillingClass
+	Backend string
+	Tokens  int
+	CostUSD float64
+}
+
 // ContextUsage is the minimum usage information required for display.
 // Token aggregation and model-window resolution must already be done by each
 // provider; this type only carries the final result.
@@ -19,12 +45,7 @@ type ContextUsage struct {
 	// SessionCache aggregates prompt-cache counters for the current transcript
 	// segment. Sidebar hit rate prefers this; recorded TTL still comes from Cache.
 	SessionCache *CacheUsage
-	// SessionTokens is cumulative billed tokens for the session.
-	SessionTokens int
-	// SessionCostUSD is recorded or estimated cumulative session cost.
-	SessionCostUSD float64
-	// BillingProvider names the backend that billed this session.
-	BillingProvider string
-	// BillingMode is the harness-recorded billing mode.
-	BillingMode string
+	// Billing carries the session's own billing facts when the provider
+	// records them, and is nil when it does not.
+	Billing *SessionBilling
 }

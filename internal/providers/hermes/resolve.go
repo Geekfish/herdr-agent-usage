@@ -34,8 +34,12 @@ type sessionRow struct {
 }
 
 type message struct {
-	Role, Content, APIContent, ToolCallID string
-	ToolCalls                             any
+	Role string
+	// Nullable columns keep their SQL null state: Hermes's fingerprint
+	// includes any field that is not None, so an empty string and a NULL
+	// produce different digests and must not be conflated.
+	Content, APIContent, ToolCallID sql.NullString
+	ToolCalls                       any
 }
 
 // ResolveHome returns the active Hermes profile home. HERMES_HOME is the
@@ -90,18 +94,25 @@ func ResolveUsageIn(home, sessionID string) *core.ContextUsage {
 
 	messages := activeMessages(db, sessionID)
 	contextTokens := anchoredTokens(row.modelConfig, messages)
+	// Reasoning tokens are omitted deliberately: Hermes's output_tokens
+	// already contains them, so adding them again double-counts the turn.
+	sessionTokens := nonNegative(row.input) + nonNegative(row.cacheRead) +
+		nonNegative(row.cacheWrite) + nonNegative(row.output)
 	usage := &core.ContextUsage{
-		SessionTokens:   nonNegative(row.input) + nonNegative(row.cacheRead) + nonNegative(row.cacheWrite) + nonNegative(row.output),
-		SessionCostUSD:  preferredCost(row.actualCost, row.estimatedCost),
-		BillingProvider: backendIdentity(row.billingProvider, row.billingBaseURL),
-		BillingMode:     row.billingMode,
-		SessionCache:    core.CacheFromTokenCounts(nonNegative(row.input), nonNegative(row.cacheRead), nonNegative(row.cacheWrite)),
+		SessionCache: core.CacheFromTokenCounts(nonNegative(row.input), nonNegative(row.cacheRead), nonNegative(row.cacheWrite)),
+		Billing: &core.SessionBilling{
+			Class:   classifyBillingMode(row.billingMode),
+			Backend: backendIdentity(row.billingProvider, row.billingBaseURL),
+			Tokens:  sessionTokens,
+			CostUSD: preferredCost(row.actualCost, row.estimatedCost),
+		},
 	}
 	if contextTokens != nil {
 		usage.ContextTokens = *contextTokens
 	}
 	usage.WindowTokens = contextWindow(home, row.model, row.modelConfig, row.billingBaseURL)
-	if usage.ContextTokens == 0 && usage.SessionTokens == 0 && usage.SessionCache == nil && usage.BillingProvider == "" && usage.WindowTokens == nil {
+	if usage.ContextTokens == 0 && sessionTokens == 0 && usage.SessionCache == nil &&
+		usage.Billing.Backend == "" && usage.WindowTokens == nil {
 		return nil
 	}
 	return usage
@@ -131,11 +142,13 @@ func activeMessages(db *sql.DB, sessionID string) []message {
 	if !cols["session_id"] || !cols["role"] || !cols["content"] {
 		return nil
 	}
+	// A column absent from this schema version scans as NULL, which is what
+	// Hermes recorded when the field did not exist.
 	expr := func(name string) string {
 		if cols[name] {
-			return "COALESCE(" + name + ", '')"
+			return name
 		}
-		return "''"
+		return "NULL"
 	}
 	where := "session_id = ?"
 	if cols["active"] {
@@ -145,7 +158,7 @@ func activeMessages(db *sql.DB, sessionID string) []message {
 	if cols["id"] {
 		order = "id"
 	}
-	rows, err := db.Query(`SELECT role, COALESCE(content, ''), `+expr("api_content")+`, `+expr("tool_call_id")+`, `+expr("tool_calls")+` FROM messages WHERE `+where+` ORDER BY `+order, sessionID)
+	rows, err := db.Query(`SELECT role, content, `+expr("api_content")+`, `+expr("tool_call_id")+`, `+expr("tool_calls")+` FROM messages WHERE `+where+` ORDER BY `+order, sessionID)
 	if err != nil {
 		return nil
 	}
@@ -153,14 +166,14 @@ func activeMessages(db *sql.DB, sessionID string) []message {
 	var out []message
 	for rows.Next() {
 		var m message
-		var toolCalls string
+		var toolCalls sql.NullString
 		if rows.Scan(&m.Role, &m.Content, &m.APIContent, &m.ToolCallID, &toolCalls) != nil {
 			continue
 		}
-		if toolCalls != "" {
+		if toolCalls.Valid {
 			// decodeJSON keeps numeric literals verbatim; a float such as 5.0
 			// re-encoded as 5 would break fingerprint equality with Hermes.
-			m.ToolCalls = decodeJSON(toolCalls)
+			m.ToolCalls = decodeJSON(toolCalls.String)
 		}
 		out = append(out, m)
 	}
@@ -199,21 +212,24 @@ func anchoredTokens(config string, messages []message) *int {
 	return &total
 }
 
+// fingerprintPayload mirrors Hermes's _FINGERPRINT_KEYS projection: every
+// provider-visible field that is not None, in Hermes's own value shapes.
 func fingerprintPayload(m message) map[string]any {
 	p := map[string]any{"role": m.Role}
-	if m.Content != "" {
-		var v any
-		if v = decodeJSON(m.Content); v != nil {
-			p["content"] = v
+	if m.Content.Valid {
+		// Structured content round-trips the DB as JSON text; Hermes hashes
+		// the decoded object, a plain string as itself.
+		if decoded := decodeJSON(m.Content.String); decoded != nil {
+			p["content"] = decoded
 		} else {
-			p["content"] = m.Content
+			p["content"] = m.Content.String
 		}
 	}
-	if m.APIContent != "" {
-		p["api_content"] = m.APIContent
+	if m.APIContent.Valid {
+		p["api_content"] = m.APIContent.String
 	}
-	if m.ToolCallID != "" {
-		p["tool_call_id"] = m.ToolCallID
+	if m.ToolCallID.Valid {
+		p["tool_call_id"] = m.ToolCallID.String
 	}
 	if m.ToolCalls != nil {
 		p["tool_calls"] = m.ToolCalls
@@ -343,8 +359,10 @@ func prefixFingerprint(messages []message) string {
 
 func estimateMessage(m message) int {
 	p := fingerprintPayload(m)
-	if (m.Role == "user" || m.Role == "assistant") && m.APIContent != "" {
-		p["content"] = m.APIContent
+	// Mirrors Hermes's wire shadow: a non-empty api_content string displaces
+	// content on user/assistant rows, because that is what ships.
+	if (m.Role == "user" || m.Role == "assistant") && m.APIContent.String != "" {
+		p["content"] = m.APIContent.String
 		delete(p, "api_content")
 	}
 	return (len(canonicalJSON(p)) + 3) / 4

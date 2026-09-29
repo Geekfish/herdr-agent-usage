@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/senna-lang/herdr-agent-usage/internal/core"
 	"github.com/senna-lang/herdr-agent-usage/internal/fsutil"
 	providercontract "github.com/senna-lang/herdr-agent-usage/internal/provider"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers"
@@ -114,13 +115,16 @@ func resolveBilledPane(profiles []claude.ClaudeProfile, codexProfiles []codex.Co
 func paneBillingModeWith(profiles []claude.ClaudeProfile, codexProfiles []codex.CodexProfile, grokProfiles []grok.GrokProfile, openCodeProfiles []opencode.OpenCodeProfile, providerID string, pane OpenPaneSnapshot) BillingMode {
 	if p := providers.FindProvider(pane.Agent); p != nil {
 		if billing, ok := p.(providercontract.SessionBillingProvider); ok {
-			mode, _, _, _, found := billing.ResolveSessionBilling(providercontract.UsageResolveInput{Session: paneAgentSession(pane), Cwd: pane.Cwd, PaneID: &pane.PaneID})
-			if found {
-				switch strings.ToLower(mode) {
-				case "chat_completions", "payg", "api":
+			// The adapter has already classified its own billing routes, so
+			// this layer never interprets a vendor billing string.
+			if session, found := billing.ResolveSessionBilling(paneBillingInput(pane)); found {
+				switch session.Class {
+				case core.BillingClassPayAsYouGo:
 					return BillingPayAsYouGo
-				case "subscription":
+				case core.BillingClassSubscription:
 					return BillingSubscription
+				case core.BillingClassUnknown:
+					return BillingUnknown
 				}
 			}
 		}
@@ -256,9 +260,8 @@ func PaneBackendID(providerID string, pane OpenPaneSnapshot) string {
 func payAsYouGoBackendID(providerID string, pane OpenPaneSnapshot) string {
 	if p := providers.FindProvider(pane.Agent); p != nil {
 		if billing, ok := p.(providercontract.SessionBillingProvider); ok {
-			_, backend, _, _, found := billing.ResolveSessionBilling(providercontract.UsageResolveInput{Session: paneAgentSession(pane), Cwd: pane.Cwd, PaneID: &pane.PaneID})
-			if found {
-				return backend
+			if session, found := billing.ResolveSessionBilling(paneBillingInput(pane)); found {
+				return session.Backend
 			}
 		}
 	}

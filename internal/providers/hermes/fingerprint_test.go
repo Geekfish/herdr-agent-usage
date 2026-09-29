@@ -76,7 +76,7 @@ func TestFingerprintMatchesHermesDigest(t *testing.T) {
 	if err != nil {
 		t.Skip("python3 unavailable")
 	}
-	m := message{Role: "user", Content: "статус <ok> & 🚀"}
+	m := message{Role: "user", Content: text("статус <ok> & 🚀")}
 	script := `
 import hashlib, json
 payload = {"role": "user", "content": "\u0441\u0442\u0430\u0442\u0443\u0441 <ok> & \U0001F680"}

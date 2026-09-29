@@ -1,12 +1,15 @@
 package hermes
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/senna-lang/herdr-agent-usage/internal/core"
 	"github.com/senna-lang/herdr-agent-usage/internal/provider"
 	_ "modernc.org/sqlite"
 )
@@ -29,6 +32,21 @@ CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
 		t.Fatal(err)
 	}
 	return db
+}
+
+func text(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func sessionTokens(t *testing.T, usage *core.ContextUsage) int {
+	t.Helper()
+	if usage == nil || usage.Billing == nil {
+		t.Fatalf("no billing facts on %#v", usage)
+	}
+	return usage.Billing.Tokens
 }
 
 func anchorConfig(t *testing.T, messages []message, prompt, completion int) string {
@@ -56,7 +74,7 @@ func TestResolveUsageInRequiresExactSessionID(t *testing.T) {
 	}
 	db.Close()
 	got := ResolveUsageIn(home, "wanted")
-	if got == nil || got.SessionTokens != 133 {
+	if sessionTokens(t, got) != 133 {
 		t.Fatalf("exact session usage = %#v, want 133", got)
 	}
 	if got := ResolveUsageIn(home, "missing"); got != nil {
@@ -73,9 +91,8 @@ func TestResolveUsageInReadsWALWithoutWriting(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens) VALUES ('wal','m','{}',7)`); err != nil {
 		t.Fatal(err)
 	}
-	got := ResolveUsageIn(home, "wal")
-	if got == nil || got.SessionTokens != 7 {
-		t.Fatalf("WAL usage = %#v", got)
+	if got := sessionTokens(t, ResolveUsageIn(home, "wal")); got != 7 {
+		t.Fatalf("WAL usage = %d, want 7", got)
 	}
 	db.Close()
 }
@@ -93,20 +110,22 @@ INSERT INTO sessions VALUES ('old','m','{}',8,3)`)
 		t.Fatal(err)
 	}
 	db.Close()
-	got := ResolveUsageIn(home, "old")
-	if got == nil || got.SessionTokens != 11 {
-		t.Fatalf("old schema = %#v", got)
+	if got := sessionTokens(t, ResolveUsageIn(home, "old")); got != 11 {
+		t.Fatalf("old schema tokens = %d, want 11", got)
 	}
 }
 
 func TestAnchoredContextUsesOnlyActiveMatchingPrefixAndDelta(t *testing.T) {
 	home := t.TempDir()
 	db := openFixture(t, home)
-	base := []message{{Role: "user", Content: "hello"}, {Role: "assistant", Content: "answer"}}
+	base := []message{{Role: "user", Content: text("hello")}, {Role: "assistant", Content: text("answer")}}
 	cfg := anchorConfig(t, base, 100, 5)
-	_, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens) VALUES ('s','m',?,900,100);
-INSERT INTO messages (session_id,role,content,active) VALUES
- ('s','user','hello',1),('s','assistant','answer',1),('s','assistant','priced reply',1),('s','user','small delta',1),('s','user','inactive rewrite',0)`, cfg)
+	_, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens) VALUES ('s','m',?,900,100)`, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO messages (session_id,role,content,active) VALUES
+ ('s','user','hello',1),('s','assistant','answer',1),('s','assistant','priced reply',1),('s','user','small delta',1),('s','user','inactive rewrite',0)`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,25 +134,59 @@ INSERT INTO messages (session_id,role,content,active) VALUES
 	if got == nil || got.ContextTokens <= 105 || got.ContextTokens >= 130 {
 		t.Fatalf("anchored context = %#v", got)
 	}
-	if got.ContextTokens == got.SessionTokens {
-		t.Fatal("context must not be lifetime total")
+	if got.ContextTokens == sessionTokens(t, got) {
+		t.Fatal("context must not be the lifetime total")
 	}
 }
 
 func TestStaleAnchorDoesNotUseLifetimeAsContext(t *testing.T) {
 	home := t.TempDir()
 	db := openFixture(t, home)
-	base := []message{{Role: "user", Content: "original"}}
+	base := []message{{Role: "user", Content: text("original")}}
 	cfg := anchorConfig(t, base, 100, 5)
-	_, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens) VALUES ('s','m',?,900,100);
-INSERT INTO messages (session_id,role,content,active) VALUES ('s','user','changed',1)`, cfg)
-	if err != nil {
+	if _, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens) VALUES ('s','m',?,900,100)`, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (session_id,role,content,active) VALUES ('s','user','changed',1)`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
 	got := ResolveUsageIn(home, "s")
-	if got == nil || got.ContextTokens != 0 || got.SessionTokens != 1000 {
+	if got == nil || got.ContextTokens != 0 || sessionTokens(t, got) != 1000 {
 		t.Fatalf("stale anchor = %#v", got)
+	}
+}
+
+// Hermes's fingerprint includes any field that is not None, so a persisted
+// empty string and a NULL are different inputs. The expected digests come
+// from Hermes's own rule (computed independently below), not from the Go
+// code under test, so collapsing the two states fails here.
+func TestEmptyStringColumnsAreNotTreatedAsNull(t *testing.T) {
+	// What Hermes hashes for this row: api_content and tool_call_id are
+	// present-but-empty, so they appear in the payload.
+	payload := map[string]any{"role": "assistant", "content": "done", "api_content": "", "tool_call_id": ""}
+	lastFP := sha256Hex(canonicalJSON(payload))
+	prefixFP := sha256Hex(canonicalJSON([]any{[]any{"assistant", lastFP}}))
+	cfg, err := json.Marshal(map[string]any{"_usage_anchor": map[string]any{
+		"prompt_tokens": 100, "completion_tokens": 5, "base_count": 1,
+		"base_last_role": "assistant", "base_last_fp": lastFP, "base_prefix_fp": prefixFP,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	home := t.TempDir()
+	db := openFixture(t, home)
+	if _, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens) VALUES ('s','m',?,900,100)`, string(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (session_id,role,content,api_content,tool_call_id,active) VALUES ('s','assistant','done','','',1)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	got := ResolveUsageIn(home, "s")
+	if got == nil || got.ContextTokens != 105 {
+		t.Fatalf("empty-string columns rejected a valid anchor: %#v", got)
 	}
 }
 
@@ -150,20 +203,40 @@ VALUES ('s','openai/model-x','{"base_url":"https://gateway.example/v1"}',100,40,
 		t.Fatal(err)
 	}
 	got := ResolveUsageIn(home, "s")
-	if got == nil {
+	if got == nil || got.Billing == nil {
 		t.Fatal("nil usage")
 	}
-	if got.SessionTokens != 540 {
-		t.Fatalf("tokens=%d; reasoning was double-counted", got.SessionTokens)
+	if got.Billing.Tokens != 540 {
+		t.Fatalf("tokens=%d; reasoning was double-counted", got.Billing.Tokens)
 	}
-	if got.SessionCostUSD != 2.5 || got.BillingProvider != "llm-rosetta" || got.BillingMode != "chat_completions" {
-		t.Fatalf("billing=%#v", got)
+	if got.Billing.CostUSD != 2.5 || got.Billing.Backend != "llm-rosetta" {
+		t.Fatalf("billing=%#v", got.Billing)
+	}
+	if got.Billing.Class != core.BillingClassPayAsYouGo {
+		t.Fatalf("chat_completions must classify pay-as-you-go, got %v", got.Billing.Class)
 	}
 	if got.WindowTokens == nil || *got.WindowTokens != 180000 {
 		t.Fatalf("conservative alias window=%v", got.WindowTokens)
 	}
 	if got.SessionCache == nil || got.SessionCache.HitPercent != 60 {
 		t.Fatalf("cache=%#v", got.SessionCache)
+	}
+}
+
+// Hermes's own billing vocabulary is translated here, in the adapter, so no
+// shared layer reads a vendor string (AGENTS.md "Provider Symmetry").
+func TestBillingModeClassification(t *testing.T) {
+	for mode, want := range map[string]core.BillingClass{
+		"subscription_included":  core.BillingClassSubscription,
+		"chat_completions":       core.BillingClassPayAsYouGo,
+		"official_models_api":    core.BillingClassPayAsYouGo,
+		"official_docs_snapshot": core.BillingClassPayAsYouGo,
+		"unknown":                core.BillingClassUnknown,
+		"":                       core.BillingClassUnknown,
+	} {
+		if got := classifyBillingMode(mode); got != want {
+			t.Errorf("%q: got %v, want %v", mode, got, want)
+		}
 	}
 }
 
@@ -192,11 +265,18 @@ func TestProfileIsolationAndProviderSessionKind(t *testing.T) {
 	}
 	t.Setenv("HERMES_HOME", homeB)
 	got := Provider.ResolveUsage(provider.UsageResolveInput{Session: &provider.AgentSession{Kind: "id", Value: "same"}})
-	if got == nil || got.SessionTokens != 9 {
+	if sessionTokens(t, got) != 9 {
 		t.Fatalf("profile result=%#v", got)
 	}
 	if got := Provider.ResolveUsage(provider.UsageResolveInput{Session: &provider.AgentSession{Kind: "path", Value: "same"}}); got != nil {
 		t.Fatalf("non-id=%#v", got)
+	}
+	billing, ok := Provider.ResolveSessionBilling(provider.UsageResolveInput{Session: &provider.AgentSession{Kind: "id", Value: "same"}})
+	if !ok || billing.Tokens != 9 {
+		t.Fatalf("session billing=%#v ok=%v", billing, ok)
+	}
+	if _, ok := Provider.ResolveSessionBilling(provider.UsageResolveInput{Session: &provider.AgentSession{Kind: "id", Value: "absent"}}); ok {
+		t.Fatal("absent session must report no billing evidence")
 	}
 }
 
@@ -206,7 +286,7 @@ func TestCostAndBaseURLFallback(t *testing.T) {
 	_, _ = db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,billing_base_url,billing_mode,estimated_cost_usd) VALUES ('s','m','{}',1,'https://api.deepseek.com/v1','chat_completions',0.75)`)
 	db.Close()
 	got := ResolveUsageIn(home, "s")
-	if got.SessionCostUSD != .75 || got.BillingProvider != "deepseek" {
+	if got == nil || got.Billing == nil || got.Billing.CostUSD != .75 || got.Billing.Backend != "deepseek" {
 		t.Fatalf("fallback=%#v", got)
 	}
 }
@@ -235,7 +315,7 @@ func TestToolCallFloatsPreserveAnchorValidity(t *testing.T) {
 	home := t.TempDir()
 	db := openFixture(t, home)
 	toolCalls := `[{"id":"c1","function":{"name":"f","arguments":"{}"},"index":5.0}]`
-	base := []message{{Role: "assistant", Content: "calling", ToolCalls: decodeJSON(toolCalls)}}
+	base := []message{{Role: "assistant", Content: text("calling"), ToolCalls: decodeJSON(toolCalls)}}
 	cfg := anchorConfig(t, base, 100, 5)
 	if _, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens) VALUES ('s','m',?,900,100)`, cfg); err != nil {
 		t.Fatal(err)

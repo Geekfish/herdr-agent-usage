@@ -32,11 +32,13 @@ type UsageProvider interface {
 	ResolveUsage(input UsageResolveInput) *core.ContextUsage
 }
 
-// SessionBillingProvider exposes session-local billing facts when a harness
-// persists them alongside context usage.
+// SessionBillingProvider is implemented by providers whose harness records
+// what each session billed. The provider classifies its own vendor billing
+// routes into the shared core.BillingClass, so shared layers never interpret
+// a vendor string. ok=false means the session has no billing evidence.
 type SessionBillingProvider interface {
 	UsageProvider
-	ResolveSessionBilling(input UsageResolveInput) (mode, backend string, tokens int, costUSD float64, ok bool)
+	ResolveSessionBilling(input UsageResolveInput) (billing core.SessionBilling, ok bool)
 }
 
 // FuncProvider is a function-backed UsageProvider.

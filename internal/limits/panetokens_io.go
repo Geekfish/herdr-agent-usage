@@ -312,9 +312,8 @@ func tokensForPaneWith(profiles []claude.ClaudeProfile, codexProfiles []codex.Co
 func PaneTotalUsage(providerID string, pane OpenPaneSnapshot, nowMs int64) (tokens float64, costUSD float64) {
 	if p := providers.FindProvider(pane.Agent); p != nil {
 		if billing, ok := p.(providercontract.SessionBillingProvider); ok {
-			_, _, total, cost, found := billing.ResolveSessionBilling(providercontract.UsageResolveInput{Session: paneAgentSession(pane), Cwd: pane.Cwd, PaneID: &pane.PaneID})
-			if found {
-				return float64(total), cost
+			if session, found := billing.ResolveSessionBilling(paneBillingInput(pane)); found {
+				return float64(session.Tokens), session.CostUSD
 			}
 		}
 	}
@@ -508,11 +507,13 @@ func cwdStr(pane OpenPaneSnapshot) string {
 	return *pane.Cwd
 }
 
-func paneAgentSession(pane OpenPaneSnapshot) *providercontract.AgentSession {
-	if pane.SessionID == nil {
-		return nil
+// paneBillingInput adapts one open pane to the shared provider resolve input.
+func paneBillingInput(pane OpenPaneSnapshot) providercontract.UsageResolveInput {
+	var session *providercontract.AgentSession
+	if pane.SessionID != nil {
+		session = &providercontract.AgentSession{Kind: "id", Value: *pane.SessionID}
 	}
-	return &providercontract.AgentSession{Kind: "id", Value: *pane.SessionID}
+	return providercontract.UsageResolveInput{Session: session, Cwd: pane.Cwd, PaneID: &pane.PaneID}
 }
 
 // claudeTokensForPaneIn sums one pane's windowed tokens from an explicit
