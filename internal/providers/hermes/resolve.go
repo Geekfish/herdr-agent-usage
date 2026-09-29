@@ -18,6 +18,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/senna-lang/herdr-agent-usage/internal/core"
@@ -200,7 +202,7 @@ func fingerprintPayload(m message) map[string]any {
 	p := map[string]any{"role": m.Role}
 	if m.Content != "" {
 		var v any
-		if json.Unmarshal([]byte(m.Content), &v) == nil {
+		if v = decodeJSON(m.Content); v != nil {
 			p["content"] = v
 		} else {
 			p["content"] = m.Content
@@ -219,18 +221,122 @@ func fingerprintPayload(m message) map[string]any {
 }
 
 func messageFingerprint(m message) string {
-	raw, _ := json.Marshal(fingerprintPayload(m))
-	sum := sha256.Sum256(raw)
+	sum := sha256.Sum256([]byte(canonicalJSON(fingerprintPayload(m))))
 	return hex.EncodeToString(sum[:])
 }
 
-func prefixFingerprint(messages []message) string {
-	pairs := make([][2]string, 0, len(messages))
-	for _, m := range messages {
-		pairs = append(pairs, [2]string{m.Role, messageFingerprint(m)})
+// decodeJSON parses a stored JSON payload preserving numeric literals, or
+// returns nil when the value is not JSON. Literal preservation matters:
+// Hermes hashes the Python object, where 5 and 5.0 serialize differently.
+func decodeJSON(raw string) any {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil
 	}
-	raw, _ := json.Marshal(pairs)
-	sum := sha256.Sum256(raw)
+	if dec.More() {
+		return nil
+	}
+	return v
+}
+
+// canonicalJSON reproduces Hermes's fingerprint encoding: Python
+// json.dumps(..., sort_keys=True, ensure_ascii=True, separators=(",", ":")).
+// Go's encoding/json differs on both counts it matters for — it emits raw
+// UTF-8 and HTML-escapes <, > and & — so a shared hash needs this encoder
+// rather than json.Marshal.
+func canonicalJSON(v any) string {
+	var b strings.Builder
+	writeCanonicalJSON(&b, v)
+	return b.String()
+}
+
+func writeCanonicalJSON(b *strings.Builder, v any) {
+	switch value := v.(type) {
+	case nil:
+		b.WriteString("null")
+	case bool:
+		b.WriteString(strconv.FormatBool(value))
+	case string:
+		writeCanonicalString(b, value)
+	case json.Number:
+		b.WriteString(value.String())
+	case float64:
+		b.WriteString(strconv.FormatFloat(value, 'g', -1, 64))
+	case []any:
+		b.WriteByte('[')
+		for i, item := range value {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			writeCanonicalJSON(b, item)
+		}
+		b.WriteByte(']')
+	case map[string]any:
+		keys := make([]string, 0, len(value))
+		for k := range value {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			writeCanonicalString(b, k)
+			b.WriteByte(':')
+			writeCanonicalJSON(b, value[k])
+		}
+		b.WriteByte('}')
+	default:
+		writeCanonicalString(b, fmt.Sprint(value))
+	}
+}
+
+// writeCanonicalString mirrors Python's ensure_ascii escaping, including
+// surrogate pairs for codepoints outside the basic plane.
+func writeCanonicalString(b *strings.Builder, s string) {
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			switch {
+			case r < 0x20:
+				fmt.Fprintf(b, `\u%04x`, r)
+			case r < 0x7f:
+				b.WriteRune(r)
+			case r <= 0xffff:
+				fmt.Fprintf(b, `\u%04x`, r)
+			default:
+				r -= 0x10000
+				fmt.Fprintf(b, `\u%04x\u%04x`, 0xd800+(r>>10), 0xdc00+(r&0x3ff))
+			}
+		}
+	}
+	b.WriteByte('"')
+}
+
+func prefixFingerprint(messages []message) string {
+	pairs := make([]any, 0, len(messages))
+	for _, m := range messages {
+		pairs = append(pairs, []any{m.Role, messageFingerprint(m)})
+	}
+	sum := sha256.Sum256([]byte(canonicalJSON(pairs)))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -240,8 +346,7 @@ func estimateMessage(m message) int {
 		p["content"] = m.APIContent
 		delete(p, "api_content")
 	}
-	raw, _ := json.Marshal(p)
-	return (len(raw) + 3) / 4
+	return (len(canonicalJSON(p)) + 3) / 4
 }
 
 func contextWindow(home, model, config, baseURL string) *int {
