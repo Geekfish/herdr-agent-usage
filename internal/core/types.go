@@ -19,4 +19,12 @@ type ContextUsage struct {
 	// SessionCache aggregates prompt-cache counters for the current transcript
 	// segment. Sidebar hit rate prefers this; recorded TTL still comes from Cache.
 	SessionCache *CacheUsage
+	// SessionTokens is cumulative billed tokens for the session.
+	SessionTokens int
+	// SessionCostUSD is recorded or estimated cumulative session cost.
+	SessionCostUSD float64
+	// BillingProvider names the backend that billed this session.
+	BillingProvider string
+	// BillingMode is the harness-recorded billing mode.
+	BillingMode string
 }

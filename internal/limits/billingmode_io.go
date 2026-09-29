@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/senna-lang/herdr-agent-usage/internal/fsutil"
+	providercontract "github.com/senna-lang/herdr-agent-usage/internal/provider"
+	"github.com/senna-lang/herdr-agent-usage/internal/providers"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/claude"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/codex"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/grok"
@@ -110,6 +112,19 @@ func resolveBilledPane(profiles []claude.ClaudeProfile, codexProfiles []codex.Co
 // CLAUDE_CONFIG_DIR — the read side (panel/sidebar) never sees that env var, so
 // per-profile billing detection must thread the resolved profile's paths.
 func paneBillingModeWith(profiles []claude.ClaudeProfile, codexProfiles []codex.CodexProfile, grokProfiles []grok.GrokProfile, openCodeProfiles []opencode.OpenCodeProfile, providerID string, pane OpenPaneSnapshot) BillingMode {
+	if p := providers.FindProvider(pane.Agent); p != nil {
+		if billing, ok := p.(providercontract.SessionBillingProvider); ok {
+			mode, _, _, _, found := billing.ResolveSessionBilling(providercontract.UsageResolveInput{Session: paneAgentSession(pane), Cwd: pane.Cwd, PaneID: &pane.PaneID})
+			if found {
+				switch strings.ToLower(mode) {
+				case "chat_completions", "payg", "api":
+					return BillingPayAsYouGo
+				case "subscription":
+					return BillingSubscription
+				}
+			}
+		}
+	}
 	if profile, ok := profileByIDIn(profiles, providerID); ok {
 		return claudePaneBillingModeIn(profile.ConfigDir, pane)
 	}
@@ -239,6 +254,14 @@ func PaneBackendID(providerID string, pane OpenPaneSnapshot) string {
 // OpenCode / Codex record a per-session provider. Claude uses deployment
 // env (settings + process); Grok joins session modelId with config.toml.
 func payAsYouGoBackendID(providerID string, pane OpenPaneSnapshot) string {
+	if p := providers.FindProvider(pane.Agent); p != nil {
+		if billing, ok := p.(providercontract.SessionBillingProvider); ok {
+			_, backend, _, _, found := billing.ResolveSessionBilling(providercontract.UsageResolveInput{Session: paneAgentSession(pane), Cwd: pane.Cwd, PaneID: &pane.PaneID})
+			if found {
+				return backend
+			}
+		}
+	}
 	if profile, ok := claudeProfileByID(providerID); ok {
 		return ResolveClaudeBackendID(loadClaudeEnvIn(profile.ConfigDir, cwdStr(pane)))
 	}

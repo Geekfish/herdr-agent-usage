@@ -32,6 +32,13 @@ type UsageProvider interface {
 	ResolveUsage(input UsageResolveInput) *core.ContextUsage
 }
 
+// SessionBillingProvider exposes session-local billing facts when a harness
+// persists them alongside context usage.
+type SessionBillingProvider interface {
+	UsageProvider
+	ResolveSessionBilling(input UsageResolveInput) (mode, backend string, tokens int, costUSD float64, ok bool)
+}
+
 // FuncProvider is a function-backed UsageProvider.
 type FuncProvider struct {
 	ID   string
