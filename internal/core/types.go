@@ -35,6 +35,9 @@ type SessionBilling struct {
 type ContextUsage struct {
 	// ContextTokens is the current context-occupying token count (already aggregated).
 	ContextTokens int
+	// ContextUnavailable distinguishes an unresolved measurement from a measured
+	// zero while allowing providers to keep publishing cache and billing facts.
+	ContextUnavailable bool
 	// WindowTokens is the context window size if known. When nil, only the absolute token count is shown.
 	WindowTokens *int
 	// Compacted marks a post-compaction estimate (no real usage row yet):

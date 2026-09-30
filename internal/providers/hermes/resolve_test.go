@@ -152,8 +152,11 @@ func TestStaleAnchorDoesNotUseLifetimeAsContext(t *testing.T) {
 	}
 	db.Close()
 	got := ResolveUsageIn(home, "s")
-	if got == nil || got.ContextTokens != 0 || sessionTokens(t, got) != 1000 {
+	if got == nil || !got.ContextUnavailable || got.ContextTokens != 0 || sessionTokens(t, got) != 1000 {
 		t.Fatalf("stale anchor = %#v", got)
+	}
+	if status := core.FormatUsageStatus(*got, core.FormatUsageOptions{}); status != "" {
+		t.Fatalf("stale anchor rendered context status %q, want empty", status)
 	}
 }
 

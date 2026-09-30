@@ -99,7 +99,8 @@ func ResolveUsageIn(home, sessionID string) *core.ContextUsage {
 	sessionTokens := nonNegative(row.input) + nonNegative(row.cacheRead) +
 		nonNegative(row.cacheWrite) + nonNegative(row.output)
 	usage := &core.ContextUsage{
-		SessionCache: core.CacheFromTokenCounts(nonNegative(row.input), nonNegative(row.cacheRead), nonNegative(row.cacheWrite)),
+		ContextUnavailable: contextTokens == nil,
+		SessionCache:       core.CacheFromTokenCounts(nonNegative(row.input), nonNegative(row.cacheRead), nonNegative(row.cacheWrite)),
 		Billing: &core.SessionBilling{
 			Class:   classifyBillingMode(row.billingMode),
 			Backend: backendIdentity(row.billingProvider, row.billingBaseURL),
