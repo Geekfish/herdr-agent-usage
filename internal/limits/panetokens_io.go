@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	providercontract "github.com/senna-lang/herdr-agent-usage/internal/provider"
-	"github.com/senna-lang/herdr-agent-usage/internal/providers"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/claude"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/codex"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/grok"
@@ -310,12 +309,8 @@ func tokensForPaneWith(profiles []claude.ClaudeProfile, codexProfiles []codex.Co
 // costUSD is 0 when the harness records no local cost (Codex/Claude/Grok)
 // rather than when spend was genuinely zero.
 func PaneTotalUsage(providerID string, pane OpenPaneSnapshot, nowMs int64) (tokens float64, costUSD float64) {
-	if p := providers.FindProvider(pane.Agent); p != nil {
-		if billing, ok := p.(providercontract.SessionBillingProvider); ok {
-			if session, found := billing.ResolveSessionBilling(paneBillingInput(pane)); found {
-				return float64(session.Tokens), session.CostUSD
-			}
-		}
+	if session, found := SessionBillingForPane(pane); found {
+		return float64(session.Tokens), session.CostUSD
 	}
 	if profile, ok := openCodeProfileByIDIn(ResolvedOpenCodeProfiles(), providerID); ok {
 		if profile.Implicit {

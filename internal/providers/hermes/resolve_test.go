@@ -308,6 +308,24 @@ INSERT INTO sessions VALUES ('s',12,3,'openrouter','https://openrouter.ai/api/v1
 	}
 }
 
+func TestUnknownBillingClassPreservesSessionFacts(t *testing.T) {
+	home := t.TempDir()
+	db := openFixture(t, home)
+	_, err := db.Exec(`INSERT INTO sessions
+ (id,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,billing_provider,billing_mode,cost_status,estimated_cost_usd,actual_cost_usd)
+ VALUES ('unknown-billing',100000,25000,300000,50000,'llm-rosetta','chat_completions','unknown',0,0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	t.Setenv("HERMES_HOME", home)
+
+	got, ok := Provider.ResolveSessionBilling(provider.UsageResolveInput{Session: &provider.AgentSession{Kind: "id", Value: "unknown-billing"}})
+	if !ok || got.Class != core.BillingClassUnknown || got.Backend != "llm-rosetta" || got.Tokens != 475000 || got.CostUSD != 0 {
+		t.Fatalf("billing=%#v ok=%v", got, ok)
+	}
+}
+
 func TestExplicitAndUnknownContextWindows(t *testing.T) {
 	home := t.TempDir()
 	db := openFixture(t, home)

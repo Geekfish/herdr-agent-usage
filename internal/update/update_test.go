@@ -204,6 +204,7 @@ func TestSidebarSecondRowContract(t *testing.T) {
 		fallback, display     string
 		providerLimits        *limits.ProviderLimits
 		tokens, cost          float64
+		hasSessionBilling     bool
 		wantProvider, wantLim string
 	}{
 		{
@@ -248,15 +249,21 @@ func TestSidebarSecondRowContract(t *testing.T) {
 			wantProvider: "opencode", wantLim: "5h 80%",
 		},
 		{
+			name: "unknown billing with recorded session facts shows backend burn",
+			mode: limits.BillingUnknown, fallback: "llm-rosetta", display: "",
+			tokens: 475_000, hasSessionBilling: true,
+			wantProvider: "llm-rosetta", wantLim: "Σ 475k",
+		},
+		{
 			name: "token only API burn omits dollars",
 			mode: limits.BillingPayAsYouGo, fallback: "deepseek", display: "",
-			tokens:       425_000,
+			tokens: 425_000, hasSessionBilling: true,
 			wantProvider: "deepseek", wantLim: "Σ 425k",
 		},
 		{
 			name: "cost capable harness includes dollars",
 			mode: limits.BillingPayAsYouGo, fallback: "deepseek", display: "",
-			tokens: 425_000, cost: 0.04,
+			tokens: 425_000, cost: 0.04, hasSessionBilling: true,
 			wantProvider: "deepseek", wantLim: "Σ 425k $0.04",
 		},
 	}
@@ -264,7 +271,7 @@ func TestSidebarSecondRowContract(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			providerText, limitText := formatSidebarBillingTokens(
 				tt.mode, tt.fallback, tt.display, tt.providerLimits,
-				tt.tokens, tt.cost, 1_800_000_000_000, "",
+				tt.tokens, tt.cost, tt.hasSessionBilling, 1_800_000_000_000, "",
 			)
 			if providerText != tt.wantProvider || limitText != tt.wantLim {
 				t.Fatalf("got provider=%q limit=%q, want provider=%q limit=%q", providerText, limitText, tt.wantProvider, tt.wantLim)

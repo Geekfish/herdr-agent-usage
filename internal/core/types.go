@@ -21,7 +21,8 @@ const (
 
 // SessionBilling is one session's own billing facts, reported by providers
 // whose harness records what it billed. Backend is a display label for the
-// billed endpoint; Tokens and CostUSD are session-cumulative.
+// billed endpoint; Tokens and CostUSD are session-cumulative and remain valid
+// when Class is unknown.
 type SessionBilling struct {
 	Class   BillingClass
 	Backend string
