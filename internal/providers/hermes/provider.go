@@ -32,33 +32,41 @@ func (usageProvider) ResolveUsage(input provider.UsageResolveInput) *core.Contex
 	return ResolveUsageIn(ResolveHome(), *sessionID)
 }
 
-// ResolveSessionBilling reports the session's own billing facts. Hermes
-// persists them on the same row as its token counters, so one read answers
-// both the context and the billing question.
-func (p usageProvider) ResolveSessionBilling(input provider.UsageResolveInput) (core.SessionBilling, bool) {
-	usage := p.ResolveUsage(input)
-	if usage == nil || usage.Billing == nil {
+// ResolveSessionBilling reads only the session row; transcript and context
+// cache state are irrelevant to billing facts.
+func (usageProvider) ResolveSessionBilling(input provider.UsageResolveInput) (core.SessionBilling, bool) {
+	sessionID := provider.SessionID(input)
+	if sessionID == nil {
 		return core.SessionBilling{}, false
 	}
-	return *usage.Billing, true
+	db := openStateDB(ResolveHome())
+	if db == nil {
+		return core.SessionBilling{}, false
+	}
+	defer db.Close()
+	row, ok := readSessionRow(db, *sessionID)
+	if !ok {
+		return core.SessionBilling{}, false
+	}
+	return *billingFromRow(row), true
 }
 
 // Hermes billing routes that cover a session's spend under a plan the agent
 // is already paying for (agent/usage_pricing.py resolve_billing_route).
 var subscriptionBillingModes = map[string]bool{"subscription_included": true}
 
-// classifyBillingMode maps one Hermes billing route to the shared class.
-// Everything Hermes prices per token — its direct chat_completions route,
-// official model APIs, and published-price snapshots — is pay-as-you-go.
-// An unrecognised or absent route stays unknown so display fails open.
-func classifyBillingMode(mode string) core.BillingClass {
-	switch normalized := strings.ToLower(strings.TrimSpace(mode)); {
-	case normalized == "" || normalized == "unknown":
-		return core.BillingClassUnknown
-	case subscriptionBillingModes[normalized]:
+// classifyBilling maps Hermes's persisted cost evidence to the shared class.
+// actual/estimated mean token-priced usage. billing_mode contributes only the
+// explicit subscription marker; API transport labels remain unclassified.
+func classifyBilling(costStatus, mode string) core.BillingClass {
+	if subscriptionBillingModes[strings.ToLower(strings.TrimSpace(mode))] {
 		return core.BillingClassSubscription
-	default:
+	}
+	switch strings.ToLower(strings.TrimSpace(costStatus)) {
+	case "actual", "estimated":
 		return core.BillingClassPayAsYouGo
+	default:
+		return core.BillingClassUnknown
 	}
 }
 

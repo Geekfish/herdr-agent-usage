@@ -28,9 +28,9 @@ import (
 )
 
 type sessionRow struct {
-	model, modelConfig, billingProvider, billingBaseURL, billingMode string
-	input, output, cacheRead, cacheWrite                             int
-	actualCost, estimatedCost                                        float64
+	model, modelConfig, billingProvider, billingBaseURL, billingMode, costStatus string
+	input, output, cacheRead, cacheWrite                                         int
+	actualCost, estimatedCost                                                    float64
 }
 
 type message struct {
@@ -57,21 +57,50 @@ func ResolveUsageIn(home, sessionID string) *core.ContextUsage {
 	if home == "" || sessionID == "" {
 		return nil
 	}
+	db := openStateDB(home)
+	if db == nil {
+		return nil
+	}
+	defer db.Close()
+	row, ok := readSessionRow(db, sessionID)
+	if !ok {
+		return nil
+	}
+
+	messages := activeMessages(db, sessionID)
+	contextTokens := anchoredTokens(row.modelConfig, messages)
+	usage := &core.ContextUsage{
+		ContextUnavailable: contextTokens == nil,
+		SessionCache:       core.CacheFromTokenCounts(nonNegative(row.input), nonNegative(row.cacheRead), nonNegative(row.cacheWrite)),
+		Billing:            billingFromRow(row),
+	}
+	if contextTokens != nil {
+		usage.ContextTokens = *contextTokens
+	}
+	usage.WindowTokens = contextWindow(home, row.model, row.modelConfig, row.billingBaseURL)
+	if usage.ContextTokens == 0 && sessionTokenCount(row) == 0 && usage.SessionCache == nil &&
+		usage.Billing.Backend == "" && usage.WindowTokens == nil {
+		return nil
+	}
+	return usage
+}
+
+func openStateDB(home string) *sql.DB {
 	dbPath := filepath.Join(home, "state.db")
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil
 	}
-	// Read-only and query_only: the live agent owns this database, and a WAL
-	// reader must never create or rewrite journal state behind it.
 	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=query_only(1)")
 	if err != nil {
 		return nil
 	}
-	defer db.Close()
+	return db
+}
 
+func readSessionRow(db *sql.DB, sessionID string) (sessionRow, bool) {
 	cols := tableColumns(db, "sessions")
 	if !cols["id"] {
-		return nil
+		return sessionRow{}, false
 	}
 	expr := func(name, fallback string) string {
 		if cols[name] {
@@ -81,42 +110,30 @@ func ResolveUsageIn(home, sessionID string) *core.ContextUsage {
 	}
 	query := `SELECT ` + strings.Join([]string{
 		expr("model", "''"), expr("model_config", "''"), expr("billing_provider", "''"),
-		expr("billing_base_url", "''"), expr("billing_mode", "''"), expr("input_tokens", "0"),
+		expr("billing_base_url", "''"), expr("billing_mode", "''"), expr("cost_status", "''"), expr("input_tokens", "0"),
 		expr("output_tokens", "0"), expr("cache_read_tokens", "0"), expr("cache_write_tokens", "0"),
 		expr("actual_cost_usd", "0"), expr("estimated_cost_usd", "0"),
 	}, ", ") + ` FROM sessions WHERE id = ? LIMIT 1`
 	var row sessionRow
 	if err := db.QueryRow(query, sessionID).Scan(&row.model, &row.modelConfig, &row.billingProvider,
-		&row.billingBaseURL, &row.billingMode, &row.input, &row.output, &row.cacheRead,
+		&row.billingBaseURL, &row.billingMode, &row.costStatus, &row.input, &row.output, &row.cacheRead,
 		&row.cacheWrite, &row.actualCost, &row.estimatedCost); err != nil {
-		return nil
+		return sessionRow{}, false
 	}
+	return row, true
+}
 
-	messages := activeMessages(db, sessionID)
-	contextTokens := anchoredTokens(row.modelConfig, messages)
-	// Reasoning tokens are omitted deliberately: Hermes's output_tokens
-	// already contains them, so adding them again double-counts the turn.
-	sessionTokens := nonNegative(row.input) + nonNegative(row.cacheRead) +
-		nonNegative(row.cacheWrite) + nonNegative(row.output)
-	usage := &core.ContextUsage{
-		ContextUnavailable: contextTokens == nil,
-		SessionCache:       core.CacheFromTokenCounts(nonNegative(row.input), nonNegative(row.cacheRead), nonNegative(row.cacheWrite)),
-		Billing: &core.SessionBilling{
-			Class:   classifyBillingMode(row.billingMode),
-			Backend: backendIdentity(row.billingProvider, row.billingBaseURL),
-			Tokens:  sessionTokens,
-			CostUSD: preferredCost(row.actualCost, row.estimatedCost),
-		},
+func sessionTokenCount(row sessionRow) int {
+	return nonNegative(row.input) + nonNegative(row.cacheRead) + nonNegative(row.cacheWrite) + nonNegative(row.output)
+}
+
+func billingFromRow(row sessionRow) *core.SessionBilling {
+	return &core.SessionBilling{
+		Class:   classifyBilling(row.costStatus, row.billingMode),
+		Backend: backendIdentity(row.billingProvider, row.billingBaseURL),
+		Tokens:  sessionTokenCount(row),
+		CostUSD: preferredCost(row.actualCost, row.estimatedCost),
 	}
-	if contextTokens != nil {
-		usage.ContextTokens = *contextTokens
-	}
-	usage.WindowTokens = contextWindow(home, row.model, row.modelConfig, row.billingBaseURL)
-	if usage.ContextTokens == 0 && sessionTokens == 0 && usage.SessionCache == nil &&
-		usage.Billing.Backend == "" && usage.WindowTokens == nil {
-		return nil
-	}
-	return usage
 }
 
 func tableColumns(db *sql.DB, table string) map[string]bool {
@@ -218,13 +235,7 @@ func anchoredTokens(config string, messages []message) *int {
 func fingerprintPayload(m message) map[string]any {
 	p := map[string]any{"role": m.Role}
 	if m.Content.Valid {
-		// Structured content round-trips the DB as JSON text; Hermes hashes
-		// the decoded object, a plain string as itself.
-		if decoded := decodeJSON(m.Content.String); decoded != nil {
-			p["content"] = decoded
-		} else {
-			p["content"] = m.Content.String
-		}
+		p["content"] = loadedContent(m.Role, m.Content.String)
 	}
 	if m.APIContent.Valid {
 		p["api_content"] = m.APIContent.String
@@ -241,6 +252,24 @@ func fingerprintPayload(m message) map[string]any {
 func messageFingerprint(m message) string {
 	sum := sha256.Sum256([]byte(canonicalJSON(fingerprintPayload(m))))
 	return hex.EncodeToString(sum[:])
+}
+
+const contentJSONPrefix = "\x00json:"
+
+// loadedContent mirrors SessionDB's durable-row projection before usage
+// anchoring: only sentinel-prefixed structured content is decoded, while
+// user and assistant strings are stripped on load.
+func loadedContent(role, stored string) any {
+	var content any = stored
+	if strings.HasPrefix(stored, contentJSONPrefix) {
+		if decoded := decodeJSON(strings.TrimPrefix(stored, contentJSONPrefix)); decoded != nil {
+			content = decoded
+		}
+	}
+	if text, ok := content.(string); ok && (role == "user" || role == "assistant") {
+		return strings.TrimSpace(text)
+	}
+	return content
 }
 
 // decodeJSON parses a stored JSON payload preserving numeric literals, or

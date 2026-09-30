@@ -24,7 +24,7 @@ func openFixture(t *testing.T, home string) *sql.DB {
  id TEXT PRIMARY KEY, cwd TEXT, model TEXT, model_config TEXT,
  input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
  cache_write_tokens INTEGER, reasoning_tokens INTEGER, billing_provider TEXT,
- billing_base_url TEXT, billing_mode TEXT, estimated_cost_usd REAL,
+ billing_base_url TEXT, billing_mode TEXT, cost_status TEXT, estimated_cost_usd REAL,
  actual_cost_usd REAL);
 CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
  content TEXT, api_content TEXT, tool_call_id TEXT, tool_calls TEXT, active INTEGER);`)
@@ -193,11 +193,50 @@ func TestEmptyStringColumnsAreNotTreatedAsNull(t *testing.T) {
 	}
 }
 
+// These fingerprints were produced by upstream SessionDB._decode_content,
+// SessionDB._loaded_view_content, and agent.usage_anchor on persisted rows.
+// They deliberately do not call this package's projection helpers.
+func TestPersistedContentMatchesUpstreamLoadedProjection(t *testing.T) {
+	cases := []struct {
+		name, role, stored, fingerprint string
+	}{
+		{"trim_user_scalar", "user", "  42  ", "2759c380a85473f64dab55ebc03e43df9c8d996114a9c3d1d6c4daf3cc4e9365"},
+		{"trim_assistant_json_text", "assistant", `  {"ok":true}  `, "91a6121f5607fae218e6cc23de7a1cbb7d3dc9931af6fd6f57a45fe226ed569e"},
+		{"plain_tool_json_stays_text", "tool", `{"result":42}`, "e8059a8f3f6f250c991899c70118e4290eddc312a5302849c629ba5b0d630f38"},
+		{"sentinel_multimodal_decodes", "user", "\x00json:[{\"type\":\"text\",\"text\":\"hello\"}]", "605b2cd3bceaf2d08e7ba22785ed603b5cce260a16f3215a2b9751da809810e2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			db := openFixture(t, home)
+			cfg, err := json.Marshal(map[string]any{"_usage_anchor": map[string]any{
+				"prompt_tokens": 1000, "completion_tokens": 10, "base_count": 1,
+				"base_last_role": tc.role, "base_last_fp": tc.fingerprint,
+				"base_prefix_fp": sha256Hex(canonicalJSON([]any{[]any{tc.role, tc.fingerprint}})),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO sessions (id,model,model_config) VALUES ('s','m',?)`, string(cfg)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`INSERT INTO messages (session_id,role,content,active) VALUES ('s',?,?,1)`, tc.role, tc.stored); err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
+			got := ResolveUsageIn(home, "s")
+			if got == nil || got.ContextUnavailable || got.ContextTokens != 1010 {
+				t.Fatalf("upstream anchor rejected: %#v", got)
+			}
+		})
+	}
+}
+
 func TestUsageFieldsAndWindowResolution(t *testing.T) {
 	home := t.TempDir()
 	db := openFixture(t, home)
-	_, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,billing_provider,billing_base_url,billing_mode,estimated_cost_usd,actual_cost_usd)
-VALUES ('s','openai/model-x','{"base_url":"https://gateway.example/v1"}',100,40,300,100,25,'llm-rosetta','https://ignored.example/v1','chat_completions',1.25,2.5)`)
+	_, err := db.Exec(`INSERT INTO sessions (id,model,model_config,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,billing_provider,billing_base_url,billing_mode,cost_status,estimated_cost_usd,actual_cost_usd)
+VALUES ('s','openai/model-x','{"base_url":"https://gateway.example/v1"}',100,40,300,100,25,'llm-rosetta','https://ignored.example/v1','chat_completions','actual',1.25,2.5)`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +255,7 @@ VALUES ('s','openai/model-x','{"base_url":"https://gateway.example/v1"}',100,40,
 		t.Fatalf("billing=%#v", got.Billing)
 	}
 	if got.Billing.Class != core.BillingClassPayAsYouGo {
-		t.Fatalf("chat_completions must classify pay-as-you-go, got %v", got.Billing.Class)
+		t.Fatalf("actual cost status must classify pay-as-you-go, got %v", got.Billing.Class)
 	}
 	if got.WindowTokens == nil || *got.WindowTokens != 180000 {
 		t.Fatalf("conservative alias window=%v", got.WindowTokens)
@@ -226,20 +265,46 @@ VALUES ('s','openai/model-x','{"base_url":"https://gateway.example/v1"}',100,40,
 	}
 }
 
-// Hermes's own billing vocabulary is translated here, in the adapter, so no
-// shared layer reads a vendor string (AGENTS.md "Provider Symmetry").
-func TestBillingModeClassification(t *testing.T) {
-	for mode, want := range map[string]core.BillingClass{
-		"subscription_included":  core.BillingClassSubscription,
-		"chat_completions":       core.BillingClassPayAsYouGo,
-		"official_models_api":    core.BillingClassPayAsYouGo,
-		"official_docs_snapshot": core.BillingClassPayAsYouGo,
-		"unknown":                core.BillingClassUnknown,
-		"":                       core.BillingClassUnknown,
+// Hermes billing classification follows persisted cost evidence. billing_mode
+// is consulted only for the explicit subscription marker; other values are
+// API transports, not billing classes.
+func TestBillingClassificationUsesPersistedCostEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		status, mode string
+		want         core.BillingClass
+	}{
+		{"actual", "", core.BillingClassPayAsYouGo},
+		{"estimated", "", core.BillingClassPayAsYouGo},
+		{"actual", "subscription_included", core.BillingClassSubscription},
+		{"unknown", "subscription_included", core.BillingClassSubscription},
+		{"unknown", "codex_responses", core.BillingClassUnknown},
+		{"", "chat_completions", core.BillingClassUnknown},
 	} {
-		if got := classifyBillingMode(mode); got != want {
-			t.Errorf("%q: got %v, want %v", mode, got, want)
+		if got := classifyBilling(tc.status, tc.mode); got != tc.want {
+			t.Errorf("status=%q mode=%q: got %v, want %v", tc.status, tc.mode, got, tc.want)
 		}
+	}
+}
+
+func TestResolveSessionBillingNeedsOnlySessionsTable(t *testing.T) {
+	home := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(home, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE sessions (
+ id TEXT PRIMARY KEY, input_tokens INTEGER, output_tokens INTEGER,
+ billing_provider TEXT, billing_base_url TEXT, billing_mode TEXT,
+ cost_status TEXT, estimated_cost_usd REAL, actual_cost_usd REAL);
+INSERT INTO sessions VALUES ('s',12,3,'openrouter','https://openrouter.ai/api/v1',NULL,'estimated',0.25,0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	t.Setenv("HERMES_HOME", home)
+	got, ok := Provider.ResolveSessionBilling(provider.UsageResolveInput{Session: &provider.AgentSession{Kind: "id", Value: "s"}})
+	if !ok || got.Class != core.BillingClassPayAsYouGo || got.Tokens != 15 || got.CostUSD != 0.25 || got.Backend != "openrouter" {
+		t.Fatalf("billing=%#v ok=%v", got, ok)
 	}
 }
 
