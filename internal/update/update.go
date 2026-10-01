@@ -295,15 +295,16 @@ func RunUpdateForPane(paneID string, force bool) {
 	var providerLimits *limits.ProviderLimits
 	var totalTokens, totalCostUSD float64
 	hasSessionBilling := false
-	if billingMode == limits.BillingPayAsYouGo {
+	switch billingMode {
+	case limits.BillingPayAsYouGo:
 		totalTokens, totalCostUSD = limits.PaneTotalUsage(providerID, snapshot, nowMs)
 		hasSessionBilling = true
-	} else if billingMode == limits.BillingUnknown {
+	case limits.BillingUnknown:
 		if billing, ok := limits.SessionBillingForPane(snapshot); ok {
 			totalTokens, totalCostUSD = float64(billing.Tokens), billing.CostUSD
 			hasSessionBilling = true
 		}
-	} else {
+	default:
 		collectOptions := limits.DefaultCollectOptions()
 		// Sidebar refresh deliberately collects only this pane's provider and leaves
 		// Attach nil, avoiding the heavier cross-pane activity aggregation path.
