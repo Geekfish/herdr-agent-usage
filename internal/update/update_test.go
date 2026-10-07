@@ -401,3 +401,38 @@ func TestReserveColumnsFor(t *testing.T) {
 		t.Fatal("empty prefix must not shrink the budget")
 	}
 }
+
+// Herdr can report agents usagebar has no provider for. $title stands in for
+// Herdr's own tab/pane tokens, so skipping such a pane leaves its row blank.
+func TestRunUpdateForPane_UnregisteredAgentWritesTitleAndProvider(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "metadata.log")
+	binPath := filepath.Join(root, "fake-herdr")
+	script := `#!/bin/sh
+if [ "$1" = pane ] && [ "$2" = get ]; then
+  printf '%s\n' '{"result":{"pane":{"agent":"my-agent","agent_status":"idle","label":"review-pane","cwd":"/tmp","tokens":{}}}}'
+  exit 0
+fi
+if [ "$1" = pane ] && [ "$2" = report-metadata ]; then
+  printf '%s\n' "$*" >> "$REVIEW_METADATA_LOG"
+fi
+`
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERDR_BIN_PATH", binPath)
+	t.Setenv("REVIEW_METADATA_LOG", logPath)
+	t.Setenv("HOME", root)
+
+	RunUpdateForPane("p1", false)
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("unregistered agent pane produced no metadata: %v", err)
+	}
+	for _, want := range []string{"--token title=review-pane", "--token provider=my-agent"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("metadata missing %q: %q", want, data)
+		}
+	}
+}
