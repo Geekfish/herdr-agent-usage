@@ -258,11 +258,12 @@ func RunUpdateForPane(paneID string, force bool) {
 	// usagebar cannot read usage for agents without a provider, but their row
 	// still needs $title and $provider in place of Herdr's own tokens. Usage left
 	// by an earlier agent in the same pane is cleared, not shown under this one.
+	// It is cleared while working too: with no provider, nothing will refill it.
 	if p == nil {
-		writeMetadataToken(pane.Tokens, paneID, "limit", "", force, retainExistingOnEmpty)
+		writeMetadataToken(pane.Tokens, paneID, "limit", "", force, false)
 		writeMetadataToken(pane.Tokens, paneID, "provider", *pane.Agent, force, retainExistingOnEmpty)
-		writeMetadataToken(pane.Tokens, paneID, "context", "", force, retainExistingOnEmpty)
-		writeCacheHitTokens(pane.Tokens, paneID, "", 0, force, retainExistingOnEmpty)
+		writeMetadataToken(pane.Tokens, paneID, "context", "", force, false)
+		writeCacheHitTokens(pane.Tokens, paneID, "", 0, force, false)
 		return
 	}
 
