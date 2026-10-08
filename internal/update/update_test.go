@@ -410,7 +410,7 @@ func TestRunUpdateForPane_UnregisteredAgentWritesTitleAndProvider(t *testing.T) 
 	binPath := filepath.Join(root, "fake-herdr")
 	script := `#!/bin/sh
 if [ "$1" = pane ] && [ "$2" = get ]; then
-  printf '%s\n' '{"result":{"pane":{"agent":"my-agent","agent_status":"idle","label":"review-pane","cwd":"/tmp","tokens":{}}}}'
+  printf '%s\n' '{"result":{"pane":{"agent":"my-agent","agent_status":"idle","label":"review-pane","cwd":"/tmp","tokens":{"limit":"5h 88%","context":"10%","cache_high":"cache hit 90%"}}}}'
   exit 0
 fi
 if [ "$1" = pane ] && [ "$2" = report-metadata ]; then
@@ -430,7 +430,15 @@ fi
 	if err != nil {
 		t.Fatalf("unregistered agent pane produced no metadata: %v", err)
 	}
-	for _, want := range []string{"--token title=review-pane", "--token provider=my-agent"} {
+	// Tokens left over from a previous agent in the same pane must not sit
+	// beside the new agent's name.
+	for _, want := range []string{
+		"--token title=review-pane",
+		"--token provider=my-agent",
+		"--clear-token limit",
+		"--clear-token context",
+		"--clear-token cache_high",
+	} {
 		if !strings.Contains(string(data), want) {
 			t.Errorf("metadata missing %q: %q", want, data)
 		}

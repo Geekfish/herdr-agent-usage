@@ -256,9 +256,13 @@ func RunUpdateForPane(paneID string, force bool) {
 	writeMetadataToken(pane.Tokens, paneID, "title", title, force, retainExistingOnEmpty)
 
 	// Agents without a provider have no usage to show, but their row still
-	// needs $title and $provider in place of Herdr's own tokens.
+	// needs $title and $provider in place of Herdr's own tokens. Usage left by
+	// an earlier agent in the same pane is cleared, not shown under this one.
 	if p == nil {
+		writeMetadataToken(pane.Tokens, paneID, "limit", "", force, retainExistingOnEmpty)
 		writeMetadataToken(pane.Tokens, paneID, "provider", *pane.Agent, force, retainExistingOnEmpty)
+		writeMetadataToken(pane.Tokens, paneID, "context", "", force, retainExistingOnEmpty)
+		writeCacheHitTokens(pane.Tokens, paneID, "", 0, force, retainExistingOnEmpty)
 		return
 	}
 
