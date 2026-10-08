@@ -255,9 +255,9 @@ func RunUpdateForPane(paneID string, force bool) {
 	title := core.ResolveSidebarTitle(naming.PaneLabel, naming.TabLabel, naming.TabNumber, naming.WorkspaceLabel)
 	writeMetadataToken(pane.Tokens, paneID, "title", title, force, retainExistingOnEmpty)
 
-	// Agents without a provider have no usage to show, but their row still
-	// needs $title and $provider in place of Herdr's own tokens. Usage left by
-	// an earlier agent in the same pane is cleared, not shown under this one.
+	// usagebar cannot read usage for agents without a provider, but their row
+	// still needs $title and $provider in place of Herdr's own tokens. Usage left
+	// by an earlier agent in the same pane is cleared, not shown under this one.
 	if p == nil {
 		writeMetadataToken(pane.Tokens, paneID, "limit", "", force, retainExistingOnEmpty)
 		writeMetadataToken(pane.Tokens, paneID, "provider", *pane.Agent, force, retainExistingOnEmpty)
